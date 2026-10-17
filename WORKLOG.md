@@ -11,3 +11,7 @@ Add a separate manual compiler-only workflow retaining the release workflow's Fl
 Do not add the unrelated stale template test as a new CI gate: `test/widget_test.dart` references `MyApp` and a counter, while current `lib/main.dart` defines `DecideForMeApp` and no `MyApp`. The original release workflow never ran `flutter test`, so no prior CI test check is removed. App and test files remain unchanged; this compiler-only check earns no test or runtime acceptance credit.
 
 The existing TestFlight workflow remains disabled and unchanged. This workflow does not install signing material, patch signing/app metadata, export, archive or upload. YAML, structural, Bash syntax and trailing-whitespace checks pass; no native build or test was executed during preparation. Actual compilation remains pending.
+
+## 2026-10-16 — Select the compatible installed Studio toolchain
+
+The actual unsigned run38991175942 failed because SDK27.1 rejects the existing iOS13 target. Studio already has native/universal Xcode26.2 at /Applications/Xcode-26.2.0.app; UID503 reads its actual Xcode17C52/SDK26.2 successfully, whose device deployment minimum is12.0. Select this toolchain in the Studio branch of both compile/release workflows, retaining hosted selection, Flutter/dependencies, app/test source and deployment targets. The release workflow stays disabled and is not dispatched. YAML/Bash and exact one-path-only comparisons pass. Rerun the manual compiler check only after this observed host-selection correction; no successful compilation is claimed yet.
