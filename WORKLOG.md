@@ -15,3 +15,9 @@ The existing TestFlight workflow remains disabled and unchanged. This workflow d
 ## 2026-10-16 — Select the compatible installed Studio toolchain
 
 The actual unsigned run38991175942 failed because SDK27.1 rejects the existing iOS13 target. Studio already has native/universal Xcode26.2 at /Applications/Xcode-26.2.0.app; UID503 reads its actual Xcode17C52/SDK26.2 successfully, whose device deployment minimum is12.0. Select this toolchain in the Studio branch of both compile/release workflows, retaining hosted selection, Flutter/dependencies, app/test source and deployment targets. The release workflow stays disabled and is not dispatched. YAML/Bash and exact one-path-only comparisons pass. Rerun the manual compiler check only after this observed host-selection correction; no successful compilation is claimed yet.
+
+## 2026-10-17 — Studio unsigned iOS compiler verified
+
+Current-source run38991845553 (1147bee) completedSUCCESS on Studio, including all post-steps. Xcode26.2/17C52 compiled the actual unsigned Release Runner.app (15.7MB), with Xcode build125.1seconds. This verifies the compatible local toolchain selection, not tests, simulator runtime, signing or store delivery. The disabled release workflow was not dispatched.
+
+Target wording clarification: committed project deployment target is12.0; pinned Flutter normally migrates the disposable build to effective13.0. Earlier app13 wording describes that effective build. No committed target or Flutter migration was changed. App/test/dependency sources remain unchanged.
