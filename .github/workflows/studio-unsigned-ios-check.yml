@@ -1,0 +1,56 @@
+name: Studio unsigned Flutter iOS compile
+
+# Manual compiler-only path; the existing signing workflow remains disabled.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: studio-unsigned-flutter-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unsigned-check:
+    name: Unsigned Flutter iOS Release compile
+    # Studio by default; STUDIO_CI_MACOS_26 restores the original hosted runner.
+    runs-on: ${{ fromJSON(format(vars.STUDIO_CI_MACOS_26 || '["self-hosted","macOS","ARM64","studio-macos","studio-run-{0}"]', github.run_id)) }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          if [[ "$RUNNER_NAME" == studio-* ]]; then
+            export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+            echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+            xcodebuild -version
+            exit 0
+          fi
+          sudo xcode-select -s /Applications/Xcode_26.2.app || sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.x'
+          channel: 'stable'
+          cache: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Disable Swift Package Manager
+        run: flutter config --no-enable-swift-package-manager
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Compile unsigned iOS Release
+        run: flutter build ios --release --no-codesign
