@@ -21,3 +21,8 @@ The actual unsigned run38991175942 failed because SDK27.1 rejects the existing i
 Current-source run38991845553 (1147bee) completedSUCCESS on Studio, including all post-steps. Xcode26.2/17C52 compiled the actual unsigned Release Runner.app (15.7MB), with Xcode build125.1seconds. This verifies the compatible local toolchain selection, not tests, simulator runtime, signing or store delivery. The disabled release workflow was not dispatched.
 
 Target wording clarification: committed project deployment target is12.0; pinned Flutter normally migrates the disposable build to effective13.0. Earlier app13 wording describes that effective build. No committed target or Flutter migration was changed. App/test/dependency sources remain unchanged.
+
+## Studio distribution trigger
+
+The iOS distribution workflow is now manual-only: removed only automatic push-main triggering. Existing workflow_dispatch, Studio routing/hosted rollback, toolchain selection, all checks, signing and binary-upload commands are unchanged. This source change does not enable/dispatch the workflow or claim signing/build/upload execution; existing disabled state remains until separately reviewed reactivation. Public submission/release authority is unchanged.
+
