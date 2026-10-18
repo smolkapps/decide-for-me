@@ -2,6 +2,12 @@ name: iOS TestFlight Distribution
 
 on:
   workflow_dispatch:
+    inputs:
+      verify_only:
+        description: Archive and export privately; skip Apple validation and upload
+        type: boolean
+        required: false
+        default: false
   push:
     branches: ["main"]
 
@@ -57,24 +63,106 @@ jobs:
           BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
-          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
-          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-
-          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
-          echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o $PP_PATH
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-
-          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH -T /usr/bin/codesign -T /usr/bin/security
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security list-keychain -d user -s $KEYCHAIN_PATH $(security list-keychains -d user | tr -d '"')
-
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles
-
+          umask 077
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$RUNNER_TEMP/build_certificate.p12"
+          echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o "$RUNNER_TEMP/build_pp.mobileprovision"
+          python3 - <<'KEYCHAIN_SNAPSHOT'
+          import json,os,pathlib,stat,subprocess
+          temporary=pathlib.Path(os.environ['RUNNER_TEMP'])
+          home=pathlib.Path(os.environ['HOME'])
+          if not home.is_absolute():raise RuntimeError('Signing HOME must be absolute')
+          for directory in [home,home/'Library',home/'Library/Preferences']:
+              if directory!=home and not os.path.lexists(directory):directory.mkdir(mode=0o700)
+              info=directory.lstat()
+              if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022:raise RuntimeError('Unsafe signing preferences directory')
+          preferences=home/'Library/Preferences/com.apple.security.plist'
+          if os.path.lexists(preferences):
+              info=preferences.lstat()
+              if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022 or not info.st_mode&0o200:raise RuntimeError('Unsafe signing preferences file')
+          keychain=temporary/'app-signing.keychain-db'
+          if os.path.lexists(keychain):raise RuntimeError('Refusing a preexisting signing keychain')
+          output=subprocess.check_output(['/usr/bin/security','list-keychains','-d','user'],text=True)
+          prior=[]
+          for line in output.splitlines():
+              value=line.strip()
+              if not value:continue
+              if len(value)<3 or not value.startswith('"/') or not value.endswith('"') or '\0' in value:raise RuntimeError('Unrecognized keychain search-list output')
+              prior.append(value[1:-1])
+          if str(keychain) in prior:raise RuntimeError('Job keychain already appears in the prior search list')
+          with os.fdopen(os.open(temporary/'legacy-decide-keychain-search-list.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as stream:
+              json.dump({'keychain_path':str(keychain),'prior_keychains':prior},stream);stream.write('\n');stream.flush();os.fsync(stream.fileno())
+          KEYCHAIN_SNAPSHOT
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/build_certificate.p12" -P "$P12_PASSWORD" -A -f pkcs12 -k "$KEYCHAIN_PATH" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          python3 - <<'SIGNING_PROFILE'
+          import hashlib,json,os,pathlib,plistlib,pwd,re,stat,subprocess,uuid
+          from datetime import datetime,timezone
+          temporary=pathlib.Path(os.environ['RUNNER_TEMP'])
+          source=temporary/'build_pp.mobileprovision'
+          keychain=temporary/'app-signing.keychain-db'
+          profile=plistlib.loads(subprocess.check_output(['/usr/bin/security','cms','-D','-i',str(source),'-k',str(keychain)]))
+          bundle='org.smolkin.DecideForMe';team='4R42A425CK'
+          if profile['TeamIdentifier']!=[team] or profile['Name']!='DecideForMe AppStore':raise RuntimeError('Unexpected app distribution profile')
+          if profile['ExpirationDate'].replace(tzinfo=timezone.utc)<=datetime.now(timezone.utc):raise RuntimeError('Distribution profile expired')
+          if profile['Entitlements']['application-identifier']!=team+'.'+bundle or profile['Entitlements']['get-task-allow'] is not False:raise RuntimeError('Unexpected distribution profile entitlements')
+          if 'ProvisionedDevices' in profile or profile.get('ProvisionsAllDevices',False):raise RuntimeError('Expected an App Store distribution profile')
+          output=subprocess.check_output(['/usr/bin/security','find-identity','-p','codesigning',str(keychain)],text=True)
+          installed={value.lower() for value in re.findall(r'^\s*\d+\)\s+([0-9A-F]{40})\b',output,re.M)}
+          identities=installed & {hashlib.sha1(cert).hexdigest() for cert in profile['DeveloperCertificates']}
+          if len(identities)!=1:raise RuntimeError('Profile must match exactly one installed distribution identity')
+          certificate=identities.pop()
+          leaf=next(cert for cert in profile['DeveloperCertificates'] if hashlib.sha1(cert).hexdigest()==certificate)
+          leaf_path=temporary/'legacy-decide-signing-public-leaf.der'
+          with os.fdopen(os.open(leaf_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:stream.write(leaf)
+          verification_log=temporary/'legacy-decide-signing-trust-verification.log'
+          with os.fdopen(os.open(verification_log,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as log:
+              verification=subprocess.run(['/usr/bin/security','verify-cert','-p','codeSign','-L','-v','-c',str(leaf_path),'-k',str(keychain)],stdout=log,stderr=subprocess.STDOUT,check=True,timeout=30)
+          # Xcode uses the account home, which can differ from the job's HOME.
+          account_home=pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
+          folder=account_home
+          for part in ['',*pathlib.Path('Library/Developer/Xcode/UserData/Provisioning Profiles').parts]:
+              if part:folder=folder/part
+              if part and not os.path.lexists(folder):folder.mkdir(mode=0o700)
+              info=folder.lstat()
+              if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022:raise RuntimeError('Unsafe account profile directory')
+          value=profile['UUID']
+          if not isinstance(value,str) or str(uuid.UUID(value)).upper()!=value.upper():raise RuntimeError('Invalid profile UUID')
+          target=folder/(value+'.mobileprovision')
+          info=source.lstat()
+          if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600:raise RuntimeError('Unsafe job profile source')
+          if info.st_dev!=folder.stat().st_dev:raise RuntimeError('Job profile and account profile directory must share a filesystem')
+          if os.path.lexists(target):raise RuntimeError('Refusing a preexisting installed profile')
+          links=[{'source':str(source),'target':str(target),'uuid':value,'device':info.st_dev,'inode':info.st_ino}]
+          with os.fdopen(os.open(temporary/'legacy-decide-profile-links.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as stream:
+              json.dump({'schema':1,'uid':os.getuid(),'account_home':str(account_home),'links':links},stream);stream.write('\n');stream.flush();os.fsync(stream.fileno())
+          os.link(source,target,follow_symlinks=False)
+          with os.fdopen(os.open(temporary/'legacy-decide-signing.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as stream:
+              json.dump({'certificate_sha1':certificate,'profile':{'bundle':bundle,'uuid':value,'name':profile['Name']},'certificate_verification':{'policy':'codeSign','exit_code':verification.returncode,'log_sha256':hashlib.sha256(verification_log.read_bytes()).hexdigest()}},stream,indent=2);stream.write('\n')
+          SIGNING_PROFILE
+          python3 - <<'KEYCHAIN_SEARCH_LIST'
+          import json,os,pathlib,subprocess
+          state=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'legacy-decide-keychain-search-list.json').read_text())
+          expected=[str(pathlib.Path(state['keychain_path']).resolve(strict=True)),*state['prior_keychains']]
+          subprocess.run(['/usr/bin/security','list-keychains','-d','user','-s',*expected],check=True,timeout=15)
+          def read_list(argv):
+              values=[]
+              for line in subprocess.check_output(argv,text=True,timeout=15).splitlines():
+                  value=line.strip()
+                  if not value:continue
+                  if len(value)<3 or not value.startswith('"/') or not value.endswith('"') or '\0' in value:raise RuntimeError('Unrecognized keychain search-list readback')
+                  values.append(str(pathlib.Path(value[1:-1]).resolve(strict=False)))
+              return values
+          wanted=[str(pathlib.Path(value).resolve(strict=False)) for value in expected]
+          actual=read_list(['/usr/bin/security','list-keychains','-d','user'])
+          if actual!=wanted:raise RuntimeError('Job keychain user search list did not persist in a fresh process')
+          combined=read_list(['/usr/bin/security','list-keychains'])
+          if wanted[0] not in combined:raise RuntimeError('Job keychain missing from the fresh combined search list')
+          print('Verified job keychain in fresh user and combined search lists.')
+          KEYCHAIN_SEARCH_LIST
       - name: Configure Manual Signing
         run: |
           python3 - <<'PYEOF'
@@ -94,10 +182,81 @@ jobs:
           with open(path, "w") as f: f.write(content)
           PYEOF
 
+      - name: Require local export for verification
+        if: ${{ success() && github.event_name == 'workflow_dispatch' && inputs.verify_only }}
+        run: |
+          python3 - <<'VERIFY_EXPORT'
+          import pathlib,plistlib
+          options=plistlib.loads(pathlib.Path('ios/Runner/ExportOptions.plist').read_bytes())
+          if options.get('destination','export')!='export':raise RuntimeError('Verification requires local export')
+          VERIFY_EXPORT
+
       - name: Build IPA
-        run: flutter build ipa --release --build-number=${{ github.run_number }} --export-options-plist=ios/Runner/ExportOptions.plist
+        run: |
+          if [ "${RUNNER_ENVIRONMENT:-}" = 'self-hosted' ]; then
+            python3 - <<'BUILD_HOME'
+          import hashlib,json,os,pathlib,pwd,stat
+          if 'XCODE_XCCONFIG_FILE' in os.environ:raise RuntimeError('Refusing an existing Xcode override context')
+          temporary=pathlib.Path(os.environ['RUNNER_TEMP'])
+          home=pathlib.Path(os.environ['HOME']).resolve(strict=True)
+          library=pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)/'Library'
+          for directory in [home,library]:
+              info=directory.lstat()
+              if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022:raise RuntimeError('Unsafe build home or account Library')
+          for value in [str(home),str(library)]:
+              if any(character in value for character in ['\r','\n','\0']) or '$(' in value or '//' in value:raise RuntimeError('Path cannot be represented as a literal Xcode setting')
+          configuration=temporary/'legacy-decide-build-home.xcconfig'
+          data=('HOME = '+str(home)+'\nUSER_LIBRARY_DIR = '+str(library)+'\n').encode()
+          with os.fdopen(os.open(configuration,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:
+              stream.write(data);stream.flush();os.fsync(stream.fileno())
+          info=configuration.lstat()
+          if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600:raise RuntimeError('Unsafe build-home configuration')
+          record={'schema':1,'operation':'step_local_XCODE_XCCONFIG_FILE','workflow_commit':os.environ['GITHUB_SHA'],'configuration_path':str(configuration),'configuration_sha256':hashlib.sha256(data).hexdigest(),'settings':{'HOME':str(home),'USER_LIBRARY_DIR':str(library)},'actual_Flutter_child_home_or_signing_proved_by_metadata':False}
+          with os.fdopen(os.open(temporary/'legacy-decide-build-home.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as stream:
+              json.dump(record,stream,indent=2);stream.write('\n');stream.flush();os.fsync(stream.fileno())
+          BUILD_HOME
+            export XCODE_XCCONFIG_FILE="$RUNNER_TEMP/legacy-decide-build-home.xcconfig"
+          fi
+          flutter build ipa --release --build-number=${{ github.run_number }} --export-options-plist=ios/Runner/ExportOptions.plist
+
+      - name: Package the verification archive and provenance
+        if: ${{ success() && github.event_name == 'workflow_dispatch' && inputs.verify_only }}
+        run: |
+          umask 077
+          python3 - <<'VERIFY_PROVENANCE'
+          import hashlib,json,os,pathlib,plistlib,subprocess
+          archives=sorted(pathlib.Path('build/ios/archive').glob('*.xcarchive'))
+          packages=sorted(pathlib.Path('build/ios/ipa').glob('*.ipa'))
+          if len(archives)!=1 or len(packages)!=1 or not packages[0].is_file():raise RuntimeError('Expected one archive and exported IPA')
+          archive=archives[0];properties=plistlib.loads((archive/'Info.plist').read_bytes())['ApplicationProperties']
+          relative=pathlib.PurePosixPath(properties['ApplicationPath']);products=archive/'Products'
+          if relative.is_absolute() or '..' in relative.parts:raise RuntimeError('Invalid archive application path')
+          app=products/relative
+          if not app.resolve().is_relative_to(products.resolve()):raise RuntimeError('Archive application escapes Products')
+          info=plistlib.loads((app/'Info.plist').read_bytes())
+          if info.get('CFBundleIdentifier')!='org.smolkin.DecideForMe':raise RuntimeError('Unexpected app bundle')
+          def digest(path):
+              with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
+          record={'schema':1,'verification_only':True,'repository':os.environ['GITHUB_REPOSITORY'],'workflow_commit':os.environ['GITHUB_SHA'],'source_commit':subprocess.check_output(['/usr/bin/git','rev-parse','HEAD'],text=True).strip(),'run_id':os.environ['GITHUB_RUN_ID'],'developer_dir':os.environ.get('DEVELOPER_DIR'),'app':{key:info.get(key) for key in ['CFBundleIdentifier','CFBundleShortVersionString','CFBundleVersion','DTPlatformName','DTSDKName','DTSDKBuild','DTXcodeBuild']},'export_options_sha256':digest(pathlib.Path('ios/Runner/ExportOptions.plist')),'ipa':{'name':packages[0].name,'bytes':packages[0].stat().st_size,'sha256':digest(packages[0])},'signing':json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'legacy-decide-signing.json').read_text()),'build_home_override':json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'legacy-decide-build-home.json').read_text()) if os.environ.get('RUNNER_ENVIRONMENT')=='self-hosted' else None,'explicit_Apple_validation_or_upload':False}
+          with os.fdopen(os.open('ci-verification.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as stream:json.dump(record,stream,indent=2);stream.write('\n')
+          VERIFY_PROVENANCE
+          verification_files=(legacy-decide-signing.json legacy-decide-signing-trust-verification.log)
+          if [ "${RUNNER_ENVIRONMENT:-}" = 'self-hosted' ]; then
+            verification_files+=(legacy-decide-build-home.xcconfig legacy-decide-build-home.json)
+          fi
+          /usr/bin/tar -czf "$RUNNER_TEMP/legacy-decide-verification.tar.gz" build/ios/archive build/ios/ipa ci-verification.json -C "$RUNNER_TEMP" "${verification_files[@]}"
+
+      - name: Retain the private verification package
+        if: ${{ success() && github.event_name == 'workflow_dispatch' && inputs.verify_only }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-decide-verification-${{ github.run_id }}
+          path: ${{ runner.temp }}/legacy-decide-verification.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Validate IPA with App Store Connect
+        if: ${{ success() && !(github.event_name == 'workflow_dispatch' && inputs.verify_only) }}
         env:
           API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
           API_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
@@ -108,9 +267,82 @@ jobs:
           xcrun altool --validate-app --type ios --file build/ios/ipa/*.ipa --apiKey "$API_KEY_ID" --apiIssuer "$API_ISSUER_ID"
 
       - name: Upload to TestFlight
+        if: ${{ success() && !(github.event_name == 'workflow_dispatch' && inputs.verify_only) }}
         env:
           API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
           API_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
           API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
         run: |
           xcrun altool --upload-app --type ios --file build/ios/ipa/*.ipa --apiKey "$API_KEY_ID" --apiIssuer "$API_ISSUER_ID"
+
+      - name: Remove only the job-owned installed provisioning profile
+        if: always()
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 - <<'PROFILE_CLEANUP'
+          import json,os,pathlib,pwd,stat,uuid
+          temporary=pathlib.Path(os.environ['RUNNER_TEMP'])
+          manifest=temporary/'legacy-decide-profile-links.json'
+          if not os.path.lexists(manifest):
+              print('Profile-link installation was not reached; no profile targets removed.')
+          else:
+              info=manifest.lstat()
+              if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600:raise RuntimeError('Unsafe profile-link manifest')
+              state=json.loads(manifest.read_text())
+              account_home=pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
+              if state.get('schema')!=1 or state.get('uid')!=os.getuid() or state.get('account_home')!=str(account_home):raise RuntimeError('Invalid profile-link manifest')
+              folder=account_home
+              for part in ['',*pathlib.Path('Library/Developer/Xcode/UserData/Provisioning Profiles').parts]:
+                  if part:folder=folder/part
+                  info=folder.lstat()
+                  if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022:raise RuntimeError('Unsafe account profile directory')
+              links=state.get('links')
+              if not isinstance(links,list) or len(links)!=1:raise RuntimeError('Invalid profile-link entries')
+              for row in links:
+                  value=row.get('uuid')
+                  if not isinstance(value,str) or str(uuid.UUID(value)).upper()!=value.upper() or row.get('source')!=str(temporary/'build_pp.mobileprovision') or row.get('target')!=str(folder/(value+'.mobileprovision')) or type(row.get('device')) is not int or type(row.get('inode')) is not int:raise RuntimeError('Invalid profile-link path binding')
+              errors=[]
+              for row in links:
+                  source=pathlib.Path(row['source']);target=pathlib.Path(row['target'])
+                  try:
+                      if not os.path.lexists(target):continue
+                      original=source.lstat();installed=target.lstat()
+                      if not stat.S_ISREG(original.st_mode) or original.st_uid!=os.getuid() or stat.S_IMODE(original.st_mode)!=0o600 or (original.st_dev,original.st_ino)!=(row['device'],row['inode']):raise RuntimeError('Original job profile identity changed')
+                      if not stat.S_ISREG(installed.st_mode) or installed.st_uid!=os.getuid() or not os.path.samefile(source,target):raise RuntimeError('Installed profile is foreign; preserving it')
+                      target.unlink()
+                  except Exception as error:errors.append(str(error))
+              if errors:raise RuntimeError('; '.join(errors))
+              print('Verified job-owned profile links absent; other account profiles preserved.')
+          PROFILE_CLEANUP
+      - name: Restore the prior keychain search list and remove job signing keychain
+        if: always()
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 - <<'KEYCHAIN_CLEANUP'
+          import json,os,pathlib,stat,subprocess
+          temporary=pathlib.Path(os.environ['RUNNER_TEMP'])
+          keychain=temporary/'app-signing.keychain-db'
+          snapshot=temporary/'legacy-decide-keychain-search-list.json'
+          if not os.path.lexists(snapshot):
+              print('Signing keychain initialization was not reached; no search-list mutation was attempted.')
+          else:
+              if snapshot.is_symlink() or not snapshot.is_file():raise RuntimeError('Invalid keychain search-list snapshot')
+              state=json.loads(snapshot.read_text())
+              prior=state.get('prior_keychains')
+              if state.get('keychain_path')!=str(keychain) or not isinstance(prior,list) or any(not isinstance(value,str) or not value.startswith('/') or '\0' in value for value in prior) or str(keychain) in prior:raise RuntimeError('Invalid keychain search-list snapshot')
+              errors=[]
+              try:
+                  subprocess.run(['/usr/bin/security','list-keychains','-d','user','-s',*prior],check=True)
+              except Exception as error:errors.append('Could not restore the prior keychain search list: '+str(error))
+              try:
+                  if os.path.lexists(keychain):
+                      if not stat.S_ISREG(keychain.lstat().st_mode):raise RuntimeError('Unexpected job keychain file type; refusing deletion')
+                      subprocess.run(['/usr/bin/security','delete-keychain',str(keychain)],check=True)
+                      if os.path.lexists(keychain):raise RuntimeError('Job keychain remains after deletion')
+              except Exception as error:errors.append('Could not remove the job signing keychain: '+str(error))
+              if errors:raise RuntimeError('; '.join(errors))
+              output=subprocess.check_output(['/usr/bin/security','list-keychains','-d','user'],text=True)
+              actual=[line.strip() for line in output.splitlines() if line.strip()]
+              if actual!=['"'+value+'"' for value in prior]:raise RuntimeError('Prior keychain search list did not match after cleanup')
+              print('Verified prior keychain search list restored and job signing keychain absent.')
+          KEYCHAIN_CLEANUP
