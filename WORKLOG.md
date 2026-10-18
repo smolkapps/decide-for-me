@@ -26,3 +26,9 @@ Target wording clarification: committed project deployment target is12.0; pinned
 
 The iOS distribution workflow is now manual-only: removed only automatic push-main triggering. Existing workflow_dispatch, Studio routing/hosted rollback, toolchain selection, all checks, signing and binary-upload commands are unchanged. This source change does not enable/dispatch the workflow or claim signing/build/upload execution; existing disabled state remains until separately reviewed reactivation. Public submission/release authority is unchanged.
 
+
+## Studio CI trigger preservation — October 18, 2026
+
+Restore the original main-push TestFlight trigger using Studio compute. Automatic distribution requires STUDIO_CI_AUTO_TESTFLIGHT=true after existing candidate checks, signing/privacy readiness and app-owner coordination, and the exact Studio profile (or its absent-variable default). Hosted rollback and unset/false opt-in skip push distribution; manual dispatch retains the complete existing build/sign/validate/upload flow. All build, signing, upload and validation steps are unchanged. No workflow was dispatched and no new signed/uploaded build is claimed. Commit this restoration with [skip ci] to avoid running distribution for the routing change itself.
+Repository-level STUDIO_CI_AUTO_TESTFLIGHT=false was explicitly set and read back before this source change, shadowing any uninspectable organization inheritance. Existing readiness checks are incomplete; the switch does not itself verify them.
+

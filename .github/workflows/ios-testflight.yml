@@ -2,9 +2,17 @@ name: iOS TestFlight Distribution
 
 on:
   workflow_dispatch:
+  push:
+    branches: ["main"]
 
 jobs:
   build_and_upload:
+    # Automatic TestFlight requires reviewed readiness and Studio; hosted rollback stays manual.
+    if: >-
+      github.event_name != 'push' ||
+      (vars.STUDIO_CI_AUTO_TESTFLIGHT == 'true' &&
+      (vars.STUDIO_CI_MACOS_26 == '' ||
+      vars.STUDIO_CI_MACOS_26 == '["self-hosted","macOS","ARM64","studio-macos","studio-run-{0}"]'))
     # Studio by default; STUDIO_CI_MACOS_26 restores the original hosted runner.
     runs-on: ${{ fromJSON(format(vars.STUDIO_CI_MACOS_26 || '["self-hosted","macOS","ARM64","studio-macos","studio-run-{0}"]', github.run_id)) }}
     timeout-minutes: 60
