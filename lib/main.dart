@@ -1,6 +1,7 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'services/version_enforcer.dart';
 
 void main() {
   runApp(const DecideForMeApp());
@@ -23,6 +24,14 @@ class DecideForMeApp extends StatelessWidget {
         colorSchemeSeed: const Color(0xFF6750A4),
         useMaterial3: true,
         brightness: Brightness.dark,
+      ),
+      builder: (context, child) => VersionEnforcerGate(
+        policyUri:
+            Uri.parse('https://smolkapps.com/api/versions/decide-for-me.json'),
+        appName: 'Decide For Me',
+        defaultAppVersion: '1.0.0',
+        defaultStoreUrl: 'https://apps.apple.com/app/id6785593979',
+        child: child!,
       ),
       home: const HomePage(),
     );
